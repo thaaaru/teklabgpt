@@ -1,0 +1,15 @@
+version: '3.9'
+services:
+  tbd-gpt:
+    build: .
+    container_name: tbd-gpt
+    env_file:
+      - .env.local
+    ports:
+      - '4000:4000'
+    volumes:
+      - ./next.config.ts:/app/next.config.ts:ro
+      - ./tailwind.config.ts:/app/tailwind.config.ts:ro
+      - ./tsconfig.json:/app/tsconfig.json:ro
+      - ./postcss.config.mjs:/app/postcss.config.mjs:ro
+      - ./eslint.config.mjs:/app/eslint.config.mjs:ro

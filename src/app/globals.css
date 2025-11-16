@@ -1,0 +1,36 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+@import "tailwindcss";
+
+@layer base {
+  * {
+    @apply border-white/5;
+  }
+
+  body {
+    @apply bg-[#05080f] text-slate-100 font-sans antialiased;
+  }
+
+  html {
+    @apply scroll-smooth;
+  }
+}
+
+@layer components {
+  .glass-panel {
+    @apply bg-white/[0.04] backdrop-blur-sm border border-white/[0.08];
+  }
+
+  .glass-panel-hover {
+    @apply transition-all duration-300 hover:bg-white/[0.06] hover:shadow-[0_0_30px_rgba(79,139,255,0.25)] hover:border-white/[0.12];
+  }
+
+  .text-gradient {
+    @apply bg-gradient-to-r from-[#6BA3FF] to-[#4F8BFF] bg-clip-text text-transparent;
+  }
+}
+
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+}
