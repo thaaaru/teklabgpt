@@ -1,42 +1,59 @@
-export type LLMId = 'chatgpt' | 'claude' | 'gemini' | 'perplexity';
+export type LLMId = string;
 
 export type LLMConfig = {
   id: LLMId;
   label: string;
   description: string;
   accent: string;
-  model: string;
 };
 
-export const LLM_CONFIG: LLMConfig[] = [
+export const DEFAULT_LLM_CONFIG: LLMConfig[] = [
   {
-    id: 'chatgpt',
-    label: 'ChatGPT',
+    id: 'openai/gpt-4-turbo',
+    label: 'ChatGPT (GPT-4 Turbo)',
     description: 'Reasoning & ideation',
     accent: 'from-emerald-500 to-teal-400',
-    model: 'openai/gpt-4o-mini',
   },
   {
-    id: 'claude',
-    label: 'Claude',
+    id: 'anthropic/claude-3.5-sonnet',
+    label: 'Claude 3.5 Sonnet',
     description: 'Enterprise analysis',
     accent: 'from-indigo-500 to-blue-500',
-    model: 'anthropic/claude-3.5-sonnet',
   },
   {
-    id: 'gemini',
-    label: 'Gemini',
-    description: 'Multimodal research',
+    id: 'google/gemini-pro-1.5',
+    label: 'Gemini Pro 1.5',
+    description: 'General multimodal research',
     accent: 'from-sky-400 to-cyan-500',
-    model: 'google/gemini-flash-1.5',
   },
   {
-    id: 'perplexity',
-    label: 'Perplexity',
+    id: 'perplexity/llama-3.1-sonar-large-128k-online',
+    label: 'Perplexity Sonar',
     description: 'Search & synthesis',
     accent: 'from-fuchsia-500 to-pink-500',
-    model: 'perplexity/sonar-large-online',
+  },
+  {
+    id: 'deepseek/deepseek-chat',
+    label: 'DeepSeek Chat',
+    description: 'Fast pragmatic reasoning',
+    accent: 'from-orange-400 to-amber-500',
   },
 ];
 
-export const getModelIdForLLM = (id: string) => LLM_CONFIG.find((config) => config.id === id)?.model;
+const ACCENT_FALLBACKS = [
+  'from-emerald-500 to-lime-500',
+  'from-sky-500 to-blue-500',
+  'from-fuchsia-500 to-rose-500',
+  'from-amber-500 to-orange-600',
+  'from-cyan-500 to-blue-500',
+  'from-purple-500 to-indigo-500',
+  'from-teal-500 to-emerald-500',
+];
+
+/**
+ * Fallback accent selector that produces a stable gradient per model id.
+ */
+export function pickAccentForModel(modelId: string): string {
+  const hash = Array.from(modelId).reduce((acc, char) => acc + char.charCodeAt(0), 0);
+  return ACCENT_FALLBACKS[hash % ACCENT_FALLBACKS.length];
+}

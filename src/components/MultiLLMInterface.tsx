@@ -1,6 +1,15 @@
 'use client';
 
-import { type ComponentType, type KeyboardEvent, type ReactNode, useMemo, useState } from 'react';
+import {
+  type ChangeEvent,
+  type ComponentType,
+  type KeyboardEvent,
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+} from 'react';
 import {
   Bot,
   Brain,
@@ -12,6 +21,7 @@ import {
   FolderKanban,
   FolderPlus,
   History,
+  Menu,
   Mic,
   Paperclip,
   Search,
@@ -22,11 +32,16 @@ import {
   Wand2,
   Loader2,
   X,
+  ChevronDown,
 } from 'lucide-react';
-import { LLM_CONFIG, type LLMId } from '@/lib/llms';
+import { DEFAULT_LLM_CONFIG, pickAccentForModel, type LLMId } from '@/lib/llms';
 import { PROMPT_CATEGORIES, PROMPT_LIBRARY, type PromptDefinition, type PromptCategoryFilter } from '@/data/prompts';
 
-type LLMDefinition = (typeof LLM_CONFIG)[number] & {
+type LLMDefinition = {
+  id: LLMId;
+  label: string;
+  description: string;
+  accent: string;
   icon: ComponentType<{ className?: string }>;
 };
 
@@ -61,17 +76,26 @@ type ProjectChatRecord = {
   messages: Message[];
 };
 
-const iconMap: Record<string, ComponentType<{ className?: string }>> = {
-  chatgpt: Sparkles,
-  claude: Brain,
-  gemini: Wand2,
-  perplexity: Workflow,
+const iconHints: { match: RegExp; icon: ComponentType<{ className?: string }> }[] = [
+  { match: /chatgpt|gpt|openai/i, icon: Sparkles },
+  { match: /claude|anthropic/i, icon: Brain },
+  { match: /gemini|google/i, icon: Wand2 },
+  { match: /perplexity|sonar/i, icon: Workflow },
+  { match: /deepseek/i, icon: Bot },
+  { match: /mistral/i, icon: BookOpen },
+];
+
+const pickIconForModel = (modelId: string): ComponentType<{ className?: string }> => {
+  const hint = iconHints.find((entry) => entry.match.test(modelId));
+  return hint?.icon ?? Sparkles;
 };
 
-const llms: LLMDefinition[] = LLM_CONFIG.map((config) => ({
+const baseLLMs: LLMDefinition[] = DEFAULT_LLM_CONFIG.map((config) => ({
   ...config,
-  icon: iconMap[config.id] ?? Sparkles,
+  icon: pickIconForModel(config.id),
 }));
+
+const defaultFeaturedIds = baseLLMs.slice(0, 5).map((llm) => llm.id);
 
 type ProjectLink = SidebarLink & {
   summary: string;
@@ -110,59 +134,183 @@ const recentChats: SidebarLink[] = [
   { id: 'research', label: 'Summarize privacy research', icon: MessageSquare, meta: 'Yesterday' },
 ];
 
-const timestamp = () => new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+const TIMESTAMP_FORMATTER = new Intl.DateTimeFormat('en-US', {
+  hour: '2-digit',
+  minute: '2-digit',
+  hour12: true,
+});
+
+const timestamp = () => TIMESTAMP_FORMATTER.format(new Date());
+
+const createIntroMessage = (llmId: string): Message => ({
+  id: `intro-${llmId}-${Date.now()}`,
+  role: 'assistant',
+  content: 'Where should we begin?',
+  timestamp: timestamp(),
+});
 
 type ProjectModalState =
   | { type: 'action'; payload: ProjectActionDefinition }
   | { type: 'project'; payload: ProjectLink }
   | null;
 
+type MasterPromptResult = {
+  prompt: string;
+  timestamp: string;
+  responses: Array<{
+    modelId: string;
+    label: string;
+    content: string;
+    agreementScore: number;
+    error?: string | null;
+  }>;
+  mergedSummary: string;
+  verificationNotes: string[];
+};
+
 export default function MultiLLMInterface() {
-  const [activeLLM, setActiveLLM] = useState<LLMId>(llms[0].id);
+  const [availableLLMs, setAvailableLLMs] = useState<LLMDefinition[]>(baseLLMs);
+  const [featuredLLMIds, setFeaturedLLMIds] = useState<string[]>(defaultFeaturedIds);
+  const [activeLLM, setActiveLLM] = useState<LLMId>(defaultFeaturedIds[0] ?? baseLLMs[0]?.id ?? 'openai/gpt-4o-mini');
   const [composerValue, setComposerValue] = useState('');
   const [conversations, setConversations] = useState<Record<string, Message[]>>(() =>
-    llms.reduce((acc, llm) => {
-      acc[llm.id] = [
-        {
-          id: `intro-${llm.id}`,
-          role: 'assistant',
-          content: 'Where should we begin?',
-          timestamp: 'Now',
-        },
-      ];
+    baseLLMs.reduce((acc, llm) => {
+      acc[llm.id] = [createIntroMessage(llm.id)];
       return acc;
     }, {} as Record<string, Message[]>),
   );
   const [pendingLLMs, setPendingLLMs] = useState<Record<string, boolean>>(() =>
-    llms.reduce((acc, llm) => {
+    baseLLMs.reduce((acc, llm) => {
       acc[llm.id] = false;
       return acc;
     }, {} as Record<string, boolean>),
   );
   const [errors, setErrors] = useState<Record<string, string | null>>(() =>
-    llms.reduce((acc, llm) => {
+    baseLLMs.reduce((acc, llm) => {
       acc[llm.id] = null;
       return acc;
     }, {} as Record<string, string | null>),
   );
+  const [isFetchingModels, setIsFetchingModels] = useState(false);
+  const [modelPickerError, setModelPickerError] = useState<string | null>(null);
   const [isPromptModalOpen, setPromptModalOpen] = useState(false);
   const [promptSearch, setPromptSearch] = useState('');
   const [promptCategory, setPromptCategory] = useState<PromptCategoryFilter>('All');
   const [promptHistory, setPromptHistory] = useState<PromptHistoryEntry[]>([]);
   const [projectModalState, setProjectModalState] = useState<ProjectModalState>(null);
   const [projectChats, setProjectChats] = useState<Record<string, ProjectChatRecord[]>>({});
+  const [isSidebarOpen, setSidebarOpen] = useState(false);
+  const [masterResult, setMasterResult] = useState<MasterPromptResult | null>(null);
+  const [isMasterPrompting, setMasterPrompting] = useState(false);
+
+  function ensureModelState(llmId: string) {
+    setConversations((prev) => {
+      if (prev[llmId]) return prev;
+      return {
+        ...prev,
+        [llmId]: [createIntroMessage(llmId)],
+      };
+    });
+    setPendingLLMs((prev) => {
+      if (llmId in prev) return prev;
+      return { ...prev, [llmId]: false };
+    });
+    setErrors((prev) => {
+      if (llmId in prev) return prev;
+      return { ...prev, [llmId]: null };
+    });
+  }
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const loadModels = async () => {
+      setIsFetchingModels(true);
+      setModelPickerError(null);
+      try {
+        const response = await fetch('/api/models', { signal: controller.signal });
+        if (!response.ok) {
+          throw new Error('Unable to fetch OpenRouter models.');
+        }
+        const payload = await response.json();
+        const remoteModels: LLMDefinition[] = Array.isArray(payload?.models)
+          ? payload.models
+              .filter((model: { id?: string }) => typeof model?.id === 'string' && model.id.trim().length > 0)
+              .map((model: { id: string; name?: string; description?: string }) => {
+                const normalizedId = model.id.trim();
+                const preset = baseLLMs.find((entry) => entry.id === normalizedId);
+                return {
+                  id: normalizedId,
+                  label: preset?.label ?? model.name ?? normalizedId,
+                  description: preset?.description ?? model.description ?? 'Available via OpenRouter',
+                  accent: preset?.accent ?? pickAccentForModel(normalizedId),
+                  icon: preset?.icon ?? pickIconForModel(normalizedId),
+                };
+              })
+          : [];
+
+        const baseIds = new Set(baseLLMs.map((llm) => llm.id));
+        const curated = baseLLMs.map((preset) => {
+          const remote = remoteModels.find((model) => model.id === preset.id);
+          return remote
+            ? {
+                ...remote,
+                label: preset.label || remote.label,
+                description: preset.description || remote.description,
+                accent: preset.accent,
+                icon: preset.icon,
+              }
+            : preset;
+        });
+        const extras = remoteModels.filter((model) => !baseIds.has(model.id));
+        setAvailableLLMs([...curated, ...extras]);
+      } catch (error) {
+        if (!controller.signal.aborted) {
+          setModelPickerError(error instanceof Error ? error.message : 'Failed to load OpenRouter models.');
+        }
+      } finally {
+        if (!controller.signal.aborted) {
+          setIsFetchingModels(false);
+        }
+      }
+    };
+
+    void loadModels();
+    return () => controller.abort();
+  }, []);
+
+  useEffect(() => {
+    if (!availableLLMs.length) return;
+    setFeaturedLLMIds((prev) => {
+      const availableIds = availableLLMs.map((llm) => llm.id);
+      const deduped = prev.filter((id, index) => availableIds.includes(id) && prev.indexOf(id) === index);
+      if (deduped.length >= 5) {
+        return deduped.slice(0, 5);
+      }
+      const extras = availableIds.filter((id) => !deduped.includes(id)).slice(0, 5 - deduped.length);
+      return deduped.length || extras.length ? [...deduped, ...extras] : prev;
+    });
+  }, [availableLLMs]);
+
+  useEffect(() => {
+    if (!featuredLLMIds.length) return;
+    setActiveLLM((current) => (current && featuredLLMIds.includes(current) ? current : featuredLLMIds[0]));
+  }, [featuredLLMIds]);
+
+  useEffect(() => {
+    if (activeLLM) {
+      ensureModelState(activeLLM);
+    }
+  }, [activeLLM]);
+
+  const getLLMDefinition = useCallback(
+    (llmId: string) => availableLLMs.find((llm) => llm.id === llmId),
+    [availableLLMs],
+  );
 
   const resetConversationForLLM = (llmId: string) => {
     setConversations((prev) => ({
       ...prev,
-      [llmId]: [
-        {
-          id: `intro-${llmId}-${Date.now()}`,
-          role: 'assistant',
-          content: 'Where should we begin?',
-          timestamp: timestamp(),
-        },
-      ],
+      [llmId]: [createIntroMessage(llmId)],
     }));
   };
 
@@ -178,7 +326,7 @@ export default function MultiLLMInterface() {
 
     const project = projectLinks.find((link) => link.id === projectId);
     if (!project) return;
-    const llmMeta = llms.find((llm) => llm.id === activeLLM);
+    const llmMeta = getLLMDefinition(activeLLM);
 
     const newChat: ProjectChatRecord = {
       id: `project-chat-${Date.now()}`,
@@ -200,7 +348,7 @@ export default function MultiLLMInterface() {
   const handleCreateProjectChat = (projectId: string) => {
     const project = projectLinks.find((link) => link.id === projectId);
     if (!project) return;
-    const llmMeta = llms.find((llm) => llm.id === activeLLM);
+    const llmMeta = getLLMDefinition(activeLLM);
 
     const introMessage: Message = {
       id: `project-intro-${projectId}-${Date.now()}`,
@@ -234,7 +382,7 @@ export default function MultiLLMInterface() {
     const chat = chats.find((entry) => entry.id === chatId);
     if (!chat) return;
 
-    setActiveLLM(chat.llmId);
+    handleFeatureLLM(chat.llmId);
     setConversations((prev) => ({
       ...prev,
       [chat.llmId]: chat.messages.map((message) => ({ ...message })),
@@ -245,6 +393,13 @@ export default function MultiLLMInterface() {
   const activeConversation = conversations[activeLLM] ?? [];
   const isThinking = pendingLLMs[activeLLM];
   const activeError = errors[activeLLM];
+  const featuredLLMs = useMemo(
+    () => featuredLLMIds.map((id) => getLLMDefinition(id)).filter((llm): llm is LLMDefinition => Boolean(llm)),
+    [featuredLLMIds, getLLMDefinition],
+  );
+  const masterButtonDisabled = !composerValue.trim() || featuredLLMs.length < 5 || isMasterPrompting;
+  const masterBlockedMessage =
+    featuredLLMs.length < 5 ? 'Pin five featured models above to enable the master prompt.' : null;
   const filteredPrompts = useMemo(() => {
     const query = promptSearch.trim().toLowerCase();
     return PROMPT_LIBRARY.filter((prompt) => {
@@ -261,7 +416,7 @@ export default function MultiLLMInterface() {
   const handleSend = async () => {
     if (!composerValue.trim() || isThinking) return;
     const trimmed = composerValue.trim();
-    const llmMeta = llms.find((llm) => llm.id === activeLLM);
+    const llmMeta = getLLMDefinition(activeLLM);
 
     const newMessage: Message = {
       id: `msg-${Date.now()}`,
@@ -281,24 +436,28 @@ export default function MultiLLMInterface() {
     setErrors((prev) => ({ ...prev, [activeLLM]: null }));
 
     try {
-      const response = await fetch('/api/chat', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          modelId: activeLLM,
-          messages: updatedThread.map((message) => ({
-            role: message.role,
-            content: message.content,
-          })),
-        }),
-      });
+        const response = await fetch('/api/chat', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            modelId: activeLLM,
+            messages: updatedThread.map((message) => ({
+              role: message.role,
+              content: message.content,
+            })),
+          }),
+        });
 
-      if (!response.ok) {
-        const errorPayload = await response.json().catch(() => ({}));
-        throw new Error(errorPayload?.error ?? `Model ${llmMeta?.label ?? 'LLM'} is unavailable.`);
-      }
+        if (!response.ok) {
+          const errorPayload = await response.json().catch(() => ({}));
+          const readable = formatErrorMessage(
+            errorPayload?.error,
+            `Model ${llmMeta?.label ?? 'LLM'} is unavailable.`,
+          );
+          throw new Error(readable);
+        }
 
       const data = await response.json();
       const assistantMessage = data?.message;
@@ -322,9 +481,10 @@ export default function MultiLLMInterface() {
         content: 'Sorry, something went wrong while contacting OpenRouter.',
         timestamp: timestamp(),
       };
+      const readable = formatErrorMessage(error, 'Unknown error occurred.');
       setErrors((prev) => ({
         ...prev,
-        [activeLLM]: error instanceof Error ? error.message : 'Unknown error occurred.',
+        [activeLLM]: readable,
       }));
       setConversations((prev) => ({
         ...prev,
@@ -332,6 +492,129 @@ export default function MultiLLMInterface() {
       }));
     } finally {
       setPendingLLMs((prev) => ({ ...prev, [activeLLM]: false }));
+    }
+  };
+
+  const handleMasterPrompt = async () => {
+    if (!composerValue.trim() || isMasterPrompting || featuredLLMs.length < 5) return;
+    const prompt = composerValue.trim();
+    const promptTimestamp = timestamp();
+    const targetLLMs = featuredLLMs.slice(0, 5);
+    setComposerValue('');
+    setMasterPrompting(true);
+
+    try {
+      const responses = await Promise.all(
+        targetLLMs.map(async (llm) => {
+          ensureModelState(llm.id);
+          const userMessage: Message = {
+            id: `master-user-${llm.id}-${Date.now()}`,
+            role: 'user',
+            content: prompt,
+            timestamp: promptTimestamp,
+          };
+          const existingThread = conversations[llm.id] ?? [createIntroMessage(llm.id)];
+          const updatedThread = [...existingThread, userMessage];
+          setConversations((prev) => ({
+            ...prev,
+            [llm.id]: updatedThread,
+          }));
+          setPendingLLMs((prev) => ({ ...prev, [llm.id]: true }));
+          setErrors((prev) => ({ ...prev, [llm.id]: null }));
+
+          try {
+        const response = await fetch('/api/chat', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            modelId: llm.id,
+            messages: updatedThread.map((message) => ({
+              role: message.role,
+              content: message.content,
+            })),
+          }),
+        });
+
+        if (!response.ok) {
+          const errorPayload = await response.json().catch(() => ({}));
+          const readable = formatErrorMessage(
+            errorPayload?.error,
+            `Model ${llm.label} is unavailable.`,
+          );
+          throw new Error(readable);
+        }
+
+            const data = await response.json();
+            const assistantMessage = data?.message;
+            const content = parseAssistantContent(assistantMessage?.content) ?? 'No answer returned.';
+            const nextMessage: Message = {
+              id: `master-assistant-${llm.id}-${Date.now()}`,
+              role: 'assistant',
+              content,
+              timestamp: timestamp(),
+            };
+
+            setConversations((prev) => ({
+              ...prev,
+              [llm.id]: [...updatedThread, nextMessage],
+            }));
+
+            return {
+              modelId: llm.id,
+              label: llm.label,
+              content,
+              error: null as string | null,
+            };
+          } catch (error) {
+            const message = formatErrorMessage(
+              error,
+              'Unknown error occurred while contacting the model.',
+            );
+            const fallbackMessage: Message = {
+              id: `master-error-${llm.id}-${Date.now()}`,
+              role: 'assistant',
+              content: 'Master prompt failed for this model.',
+              timestamp: timestamp(),
+            };
+            setErrors((prev) => ({ ...prev, [llm.id]: message }));
+            setConversations((prev) => ({
+              ...prev,
+              [llm.id]: [...updatedThread, fallbackMessage],
+            }));
+            return {
+              modelId: llm.id,
+              label: llm.label,
+              content: '',
+              error: message,
+            };
+          } finally {
+            setPendingLLMs((prev) => ({ ...prev, [llm.id]: false }));
+          }
+        }),
+      );
+
+      const analysis = analyzeMasterResponses(responses);
+      setMasterResult({
+        prompt,
+        timestamp: promptTimestamp,
+        responses: analysis.enrichedResponses,
+        mergedSummary: analysis.mergedSummary,
+        verificationNotes: analysis.verificationNotes,
+      });
+    } catch (error) {
+      setMasterResult({
+        prompt,
+        timestamp: promptTimestamp,
+        responses: [],
+        mergedSummary: 'Master prompt failed before collecting responses.',
+        verificationNotes: [
+          formatErrorMessage(error, 'Unknown error occurred while running the master prompt.'),
+        ],
+      });
+    } finally {
+      setMasterPrompting(false);
     }
   };
 
@@ -361,6 +644,16 @@ export default function MultiLLMInterface() {
     setProjectModalState({ type: 'action', payload });
   };
 
+  const handleFeatureLLM = (llmId: string) => {
+    if (!llmId) return;
+    ensureModelState(llmId);
+    setFeaturedLLMIds((prev) => {
+      const filtered = prev.filter((id) => id !== llmId);
+      return [llmId, ...filtered].slice(0, 5);
+    });
+    setActiveLLM(llmId);
+  };
+
   const handleProjectLinkClick = (link: SidebarLink) => {
     const project = projectLinks.find((entry) => entry.id === link.id);
     if (!project) return;
@@ -373,8 +666,9 @@ export default function MultiLLMInterface() {
   };
 
   return (
-    <div className="min-h-screen w-full bg-[#05080f] text-slate-100 flex">
+    <div className="min-h-screen w-full bg-[#05080f] text-slate-100 flex flex-col lg:flex-row">
       <Sidebar
+        className="hidden lg:flex"
         onOpenPromptLibrary={() => setPromptModalOpen(true)}
         promptHistory={promptHistory}
         onSelectPromptHistory={handlePromptHistorySelect}
@@ -382,18 +676,58 @@ export default function MultiLLMInterface() {
         onProjectSelected={handleProjectLinkClick}
       />
 
-      <div className="flex-1 flex flex-col border-l border-white/5 bg-gradient-to-br from-[#0a101c] via-[#05080f] to-[#020409]">
-        <TopNavigation activeLLM={activeLLM} onSelectLLM={setActiveLLM} />
+      <div className="flex-1 flex flex-col lg:border-l border-white/5 bg-gradient-to-br from-[#0a101c] via-[#05080f] to-[#020409]">
+        <MobileHeader onMenuClick={() => setSidebarOpen(true)} />
+        <TopNavigation
+          activeLLM={activeLLM}
+          featuredLLMs={featuredLLMs}
+          availableLLMs={availableLLMs}
+          onSelectLLM={setActiveLLM}
+          onFeatureLLM={handleFeatureLLM}
+          isLoadingModels={isFetchingModels}
+          modelError={modelPickerError}
+        />
 
-        <ConversationPane activeLLM={activeLLM} messages={activeConversation} isLoading={isThinking} error={activeError} />
+        <ConversationPane
+          activeLLM={activeLLM}
+          llmMeta={getLLMDefinition(activeLLM)}
+          messages={activeConversation}
+          isLoading={isThinking}
+          error={activeError}
+        />
+
+        {masterResult && (
+          <MasterPromptSummary result={masterResult} onClear={() => setMasterResult(null)} />
+        )}
 
         <MessageComposer
           value={composerValue}
           onChange={setComposerValue}
           onSubmit={handleSend}
           disabled={isThinking}
+          onMasterPrompt={handleMasterPrompt}
+          masterDisabled={masterButtonDisabled}
+          masterBlockedMessage={masterBlockedMessage}
+          isMasterRunning={isMasterPrompting}
         />
       </div>
+
+      {isSidebarOpen && (
+        <div
+          className="fixed inset-0 z-50 bg-black/70 flex justify-start items-stretch lg:hidden"
+          onClick={() => setSidebarOpen(false)}
+        >
+          <Sidebar
+            variant="mobile"
+            onCloseRequest={() => setSidebarOpen(false)}
+            onOpenPromptLibrary={() => setPromptModalOpen(true)}
+            promptHistory={promptHistory}
+            onSelectPromptHistory={handlePromptHistorySelect}
+            onProjectAction={handleProjectAction}
+            onProjectSelected={handleProjectLinkClick}
+          />
+        </div>
+      )}
 
       <PromptLibraryModal
         isOpen={isPromptModalOpen}
@@ -447,6 +781,9 @@ type SidebarProps = {
   onSelectPromptHistory: (entry: PromptHistoryEntry) => void;
   onProjectAction: (action: string) => void;
   onProjectSelected: (project: ProjectLink) => void;
+  variant?: 'desktop' | 'mobile';
+  onCloseRequest?: () => void;
+  className?: string;
 };
 
 function Sidebar({
@@ -455,15 +792,49 @@ function Sidebar({
   onSelectPromptHistory,
   onProjectAction,
   onProjectSelected,
+  variant = 'desktop',
+  onCloseRequest,
+  className,
 }: SidebarProps) {
-  return (
-    <aside className="w-72 bg-[#070b14] border-r border-white/5 flex flex-col p-6 gap-6">
-      <div className="flex items-center justify-center gap-2 rounded-2xl bg-white/10 text-white py-3 font-semibold tracking-[0.3em] uppercase">
-        <span className="text-xs text-white/60">TBD</span>
-        <span className="text-sm">GPT</span>
-      </div>
+  const baseWidth = variant === 'mobile' ? 'w-full max-w-xs' : 'w-72';
+  const sidebarClasses = [
+    baseWidth,
+    'bg-[#070b14] flex flex-col p-6 gap-6',
+    variant === 'mobile'
+      ? 'h-full shadow-2xl border-b border-white/10 overflow-y-auto'
+      : 'border-r border-white/5',
+    className ?? '',
+  ]
+    .filter(Boolean)
+    .join(' ');
 
-      <div className="relative">
+  return (
+    <aside
+      className={sidebarClasses}
+      onClick={variant === 'mobile' ? (event) => event.stopPropagation() : undefined}
+    >
+      {variant === 'mobile' ? (
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2 rounded-2xl bg-white/10 text-white px-4 py-2 font-semibold tracking-[0.3em] uppercase text-xs">
+            <span className="text-white/60">TBD</span>
+            <span>GPT</span>
+          </div>
+          <button
+            onClick={onCloseRequest}
+            className="p-2 rounded-xl border border-white/10 text-white hover:border-white/30 transition"
+            aria-label="Close menu"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      ) : (
+        <div className="flex items-center justify-center gap-2 rounded-2xl bg-white/10 text-white py-3 font-semibold tracking-[0.3em] uppercase">
+          <span className="text-xs text-white/60">TBD</span>
+          <span className="text-sm">GPT</span>
+        </div>
+      )}
+
+      <div className={`relative ${variant === 'mobile' ? 'mt-4' : ''}`}>
         <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-white/50" />
         <input
           className="w-full bg-white/5 rounded-2xl pl-11 pr-4 py-3 text-sm placeholder:text-white/50 focus:outline-none focus:ring-2 focus:ring-white/10"
@@ -645,23 +1016,55 @@ function PromptHistorySection({
   );
 }
 
-function TopNavigation({ activeLLM, onSelectLLM }: { activeLLM: LLMId; onSelectLLM: (id: LLMId) => void }) {
-  return (
-    <header className="border-b border-white/5 px-8 pt-6 pb-4 backdrop-blur">
-      <div className="flex items-center gap-3 mb-4">
-        <History className="w-4 h-4 text-white/40" />
-        <span className="text-white/70 text-sm">Choose a model</span>
-      </div>
-      <div className="flex flex-wrap gap-3">
-        {llms.map((llm) => {
-          const Icon = llm.icon;
+type TopNavigationProps = {
+  activeLLM: LLMId;
+  featuredLLMs: LLMDefinition[];
+  availableLLMs: LLMDefinition[];
+  onSelectLLM: (id: LLMId) => void;
+  onFeatureLLM: (id: LLMId) => void;
+  isLoadingModels?: boolean;
+  modelError?: string | null;
+};
 
+function TopNavigation({
+  activeLLM,
+  featuredLLMs,
+  availableLLMs,
+  onSelectLLM,
+  onFeatureLLM,
+  isLoadingModels,
+  modelError,
+}: TopNavigationProps) {
+  const availableOptions = availableLLMs.filter(
+    (option) => !featuredLLMs.some((featured) => featured.id === option.id),
+  );
+  const limitedOptions = availableOptions.slice(0, 10);
+  const extraCount = Math.max(availableOptions.length - limitedOptions.length, 0);
+
+  return (
+    <header className="border-b border-white/5 px-4 md:px-8 pt-4 pb-3 backdrop-blur sticky top-12 lg:top-0 z-20 bg-gradient-to-b from-[#05080f]/95 via-[#05080f]/85 to-transparent">
+      <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between mb-3">
+        <div className="flex items-center gap-3 text-sm text-white/70">
+          <History className="w-4 h-4 text-white/40" />
+          <span>Choose a model</span>
+        </div>
+        <ModelSelector
+          options={limitedOptions}
+          onSelect={onFeatureLLM}
+          isLoading={isLoadingModels}
+          error={modelError}
+          extraCount={extraCount}
+        />
+      </div>
+      <div className="flex gap-3 overflow-x-auto pb-1">
+        {featuredLLMs.map((llm) => {
+          const Icon = llm.icon;
           const isActive = llm.id === activeLLM;
           return (
             <button
               key={llm.id}
               onClick={() => onSelectLLM(llm.id)}
-              className={`flex-1 min-w-[180px] rounded-2xl border px-4 py-4 text-left transition ${
+              className={`min-w-[180px] flex-1 rounded-2xl border px-4 py-4 text-left transition ${
                 isActive ? 'border-white bg-white/10' : 'border-white/10 bg-white/5 hover:border-white/30'
               }`}
             >
@@ -677,30 +1080,80 @@ function TopNavigation({ activeLLM, onSelectLLM }: { activeLLM: LLMId; onSelectL
             </button>
           );
         })}
+        {!featuredLLMs.length && (
+          <div className="text-sm text-white/60 py-4">Select a model from OpenRouter to get started.</div>
+        )}
       </div>
     </header>
   );
 }
 
+type ModelSelectorProps = {
+  options: LLMDefinition[];
+  onSelect: (id: string) => void;
+  isLoading?: boolean;
+  error?: string | null;
+  extraCount?: number;
+};
+
+function ModelSelector({ options, onSelect, isLoading, error, extraCount = 0 }: ModelSelectorProps) {
+  const [selection, setSelection] = useState('');
+  const sortedOptions = [...options].sort((a, b) => a.label.localeCompare(b.label));
+
+  const handleChange = (event: ChangeEvent<HTMLSelectElement>) => {
+    const value = event.target.value;
+    if (!value) return;
+    onSelect(value);
+    setSelection('');
+  };
+
+  return (
+    <div className="relative w-full max-w-xs text-xs text-white/70">
+      <select
+        value={selection}
+        onChange={handleChange}
+        className="w-full appearance-none rounded-2xl border border-white/10 bg-white/5 px-4 py-2.5 pr-10 text-white/80 focus:border-white/40 focus:outline-none text-sm"
+      >
+        <option value="">
+          {isLoading ? 'Loading OpenRouter models…' : 'Add OpenRouter model to top bar'}
+        </option>
+        {sortedOptions.map((option) => (
+          <option key={option.id} value={option.id} className="bg-gray-900 text-white">
+            {option.label}
+          </option>
+        ))}
+      </select>
+      <ChevronDown className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-white/60" />
+      {error ? (
+        <p className="text-xs text-red-400 mt-1">{error}</p>
+      ) : (
+        <p className="text-[11px] text-white/40 mt-1">
+          Showing the top 10 addable models{extraCount > 0 ? ` (${extraCount} more hidden)` : ''}. Only five can be featured above.
+        </p>
+      )}
+    </div>
+  );
+}
+
 function ConversationPane({
   activeLLM,
+  llmMeta,
   messages,
   isLoading,
   error,
 }: {
   activeLLM: string;
+  llmMeta?: LLMDefinition;
   messages: Message[];
   isLoading: boolean;
   error?: string | null;
 }) {
-  const llmMeta = useMemo(() => llms.find((llm) => llm.id === activeLLM), [activeLLM]);
-
   return (
     <section className="flex-1 flex flex-col items-center overflow-hidden px-6 md:px-12">
       <div className="w-full max-w-3xl flex-1 overflow-y-auto py-10 space-y-6">
         <div className="text-center space-y-2">
           <p className="uppercase text-xs tracking-[0.4em] text-white/30">Conversation with</p>
-          <h1 className="text-3xl md:text-4xl font-semibold">{llmMeta?.label}</h1>
+          <h1 className="text-3xl md:text-4xl font-semibold">{llmMeta?.label ?? 'Selected model'}</h1>
           <p className="text-white/60">Where should we begin?</p>
         </div>
 
@@ -743,16 +1196,102 @@ function ConversationPane({
   );
 }
 
+type MasterPromptSummaryProps = {
+  result: MasterPromptResult;
+  onClear: () => void;
+};
+
+function MasterPromptSummary({ result, onClear }: MasterPromptSummaryProps) {
+  return (
+    <div className="px-6 md:px-12">
+      <div className="max-w-3xl mx-auto mt-6 rounded-3xl border border-white/10 bg-white/5 p-6 space-y-5">
+        <div className="flex flex-col gap-1">
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <p className="uppercase text-xs tracking-[0.3em] text-white/40">Master prompt</p>
+              <h3 className="text-2xl font-semibold text-white">Consensus report</h3>
+            </div>
+            <button
+              onClick={onClear}
+              className="px-3 py-1.5 rounded-2xl border border-white/20 text-xs text-white/70 hover:border-white/40 transition"
+            >
+              Clear
+            </button>
+          </div>
+          <p className="text-xs text-white/50">{result.timestamp}</p>
+        </div>
+
+        <div className="rounded-2xl border border-white/10 bg-white/5 p-4 text-sm text-white/80">
+          <p className="text-xs uppercase text-white/40 mb-1">Prompt</p>
+          <p className="whitespace-pre-wrap">{result.prompt}</p>
+        </div>
+
+        <div className="space-y-2">
+          <p className="text-xs uppercase tracking-[0.3em] text-white/40">Merged summary</p>
+          <div className="rounded-2xl border border-white/10 bg-[#070b14] p-4 text-sm text-white/80 space-y-2">
+            {renderFormattedContent(result.mergedSummary)}
+          </div>
+        </div>
+
+        <div className="grid gap-3 md:grid-cols-2">
+          {result.responses.map((response) => (
+            <div key={response.modelId} className="rounded-2xl border border-white/10 bg-white/5 p-4 space-y-2">
+              <div className="flex items-center justify-between">
+                <p className="font-semibold">{response.label}</p>
+                <span
+                  className={`text-xs ${
+                    response.error ? 'text-red-300' : response.agreementScore > 0.65 ? 'text-emerald-300' : 'text-amber-300'
+                  }`}
+                >
+                  {response.error
+                    ? 'Failed'
+                    : `Agreement ${(response.agreementScore * 100).toFixed(0)}%`}
+                </span>
+              </div>
+              <div className="max-h-40 overflow-y-auto text-sm text-white/80 space-y-2">
+                {response.error ? (
+                  <p className="text-red-300">{response.error}</p>
+                ) : (
+                  renderFormattedContent(response.content)
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {result.verificationNotes.length > 0 && (
+          <div>
+            <p className="text-xs uppercase tracking-[0.3em] text-white/40 mb-2">Verification</p>
+            <ul className="list-disc pl-5 text-sm text-white/80 space-y-1">
+              {result.verificationNotes.map((note, index) => (
+                <li key={`${note}-${index}`}>{note}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function MessageComposer({
   value,
   onChange,
   onSubmit,
   disabled,
+  onMasterPrompt,
+  masterDisabled,
+  masterBlockedMessage,
+  isMasterRunning,
 }: {
   value: string;
   onChange: (val: string) => void;
   onSubmit: () => void;
   disabled?: boolean;
+  onMasterPrompt: () => void;
+  masterDisabled?: boolean;
+  masterBlockedMessage?: string | null;
+  isMasterRunning?: boolean;
 }) {
   const handleSubmit = () => {
     if (disabled || !value.trim()) return;
@@ -766,6 +1305,11 @@ function MessageComposer({
     }
   };
 
+  const handleMasterPrompt = () => {
+    if (masterDisabled) return;
+    onMasterPrompt();
+  };
+
   return (
     <div className="px-6 md:px-12 pb-10">
       <div className="max-w-3xl mx-auto rounded-3xl border border-white/10 bg-white/5 backdrop-blur-lg">
@@ -773,31 +1317,49 @@ function MessageComposer({
           <Bot className="w-3.5 h-3.5" />
           <span>Secure client-side context — API keys stay local</span>
         </div>
-        <div className="flex items-end gap-3 px-4 py-4">
-          <div className="flex items-center gap-2">
-            <button className="p-3 rounded-2xl bg-white/5 hover:bg-white/10 transition">
-              <Paperclip className="w-4 h-4" />
-            </button>
-            <button className="p-3 rounded-2xl bg-white/5 hover:bg-white/10 transition">
-              <Mic className="w-4 h-4" />
-            </button>
+        <div className="flex flex-col gap-3 px-4 py-4">
+          <div className="flex flex-col gap-3 md:flex-row md:items-end">
+            <div className="flex items-center gap-2">
+              <button className="p-3 rounded-2xl bg-white/5 hover:bg-white/10 transition">
+                <Paperclip className="w-4 h-4" />
+              </button>
+              <button className="p-3 rounded-2xl bg-white/5 hover:bg-white/10 transition">
+                <Mic className="w-4 h-4" />
+              </button>
+            </div>
+            <textarea
+              value={value}
+              onChange={(e) => onChange(e.target.value)}
+              rows={2}
+              placeholder="Ask anything — research, planning, brainstorming..."
+              className="flex-1 bg-transparent resize-none outline-none text-sm text-white placeholder:text-white/40"
+              onKeyDown={handleKeyDown}
+              disabled={disabled}
+            />
+            <div className="flex flex-col gap-2 w-full md:w-auto">
+              <button
+                onClick={handleSubmit}
+                className="px-5 py-3 rounded-2xl bg-white text-black text-sm font-medium hover:bg-slate-100 transition disabled:opacity-40"
+                disabled={!value.trim() || disabled}
+              >
+                {disabled ? 'Thinking…' : 'Send'}
+              </button>
+              <button
+                onClick={handleMasterPrompt}
+                className="px-5 py-3 rounded-2xl border border-white/20 text-sm font-medium text-white hover:border-white/40 transition disabled:opacity-40"
+                disabled={masterDisabled}
+              >
+                {isMasterRunning ? 'Mastering…' : 'Master Prompt'}
+              </button>
+              {masterBlockedMessage ? (
+                <p className="text-[11px] text-white/40">{masterBlockedMessage}</p>
+              ) : (
+                <p className="text-[11px] text-white/40">
+                  Master Prompt runs all five featured models and merges their answers.
+                </p>
+              )}
+            </div>
           </div>
-          <textarea
-            value={value}
-            onChange={(e) => onChange(e.target.value)}
-            rows={2}
-            placeholder="Ask anything — research, planning, brainstorming..."
-            className="flex-1 bg-transparent resize-none outline-none text-sm text-white placeholder:text-white/40"
-            onKeyDown={handleKeyDown}
-            disabled={disabled}
-          />
-          <button
-            onClick={handleSubmit}
-            className="px-5 py-3 rounded-2xl bg-white text-black text-sm font-medium hover:bg-slate-100 transition disabled:opacity-40"
-            disabled={!value.trim() || disabled}
-          >
-            {disabled ? 'Thinking…' : 'Send'}
-          </button>
         </div>
         <div className="px-4 pb-4 text-xs text-white/40">
           Powered by OpenRouter — requests stay in your browser until sent.
@@ -896,6 +1458,22 @@ function PromptLibraryModal({
           </div>
         </div>
       </div>
+    </div>
+  );
+}
+
+function MobileHeader({ onMenuClick }: { onMenuClick: () => void }) {
+  return (
+    <div className="lg:hidden sticky top-0 z-30 flex items-center justify-between px-4 py-3 border-b border-white/10 bg-[#05080f]/95 backdrop-blur">
+      <button
+        onClick={onMenuClick}
+        className="p-2 rounded-xl border border-white/15 text-white hover:border-white/40 transition"
+        aria-label="Open navigation"
+      >
+        <Menu className="w-5 h-5" />
+      </button>
+      <div className="text-sm font-semibold tracking-[0.4em] uppercase text-white">TBD GPT</div>
+      <div className="text-[10px] uppercase tracking-[0.3em] text-white/50">AI HUB</div>
     </div>
   );
 }
@@ -1080,4 +1658,150 @@ function renderFormattedContent(content: string): ReactNode[] {
   }
 
   return elements;
+}
+
+type RawMasterResponse = {
+  modelId: string;
+  label: string;
+  content: string;
+  error: string | null;
+};
+
+function analyzeMasterResponses(responses: RawMasterResponse[]) {
+  if (!responses.length) {
+    return {
+      mergedSummary: 'No responses available.',
+      verificationNotes: ['Unable to run verification without any model responses.'],
+      enrichedResponses: [] as MasterPromptResult['responses'],
+    };
+  }
+
+  const successful = responses.filter((response) => !response.error && response.content.trim().length > 0);
+  const scoreMap = new Map<string, number>();
+  const verificationNotes: string[] = [];
+
+  if (successful.length >= 2) {
+    for (let i = 0; i < successful.length; i += 1) {
+      for (let j = i + 1; j < successful.length; j += 1) {
+        const first = successful[i];
+        const second = successful[j];
+        const similarity = computeTextSimilarity(first.content, second.content);
+        verificationNotes.push(formatSimilarityNote(first.label, second.label, similarity));
+        scoreMap.set(first.modelId, (scoreMap.get(first.modelId) ?? 0) + similarity);
+        scoreMap.set(second.modelId, (scoreMap.get(second.modelId) ?? 0) + similarity);
+      }
+    }
+  } else {
+    verificationNotes.push('Need at least two reliable responses to perform cross-verification.');
+  }
+
+  responses
+    .filter((response) => response.error)
+    .forEach((response) => verificationNotes.push(`${response.label} failed: ${response.error}`));
+
+  const enrichedResponses: MasterPromptResult['responses'] = responses.map((response) => {
+    if (response.error || !response.content.trim()) {
+      return { ...response, agreementScore: 0, error: response.error };
+    }
+    const denominator = successful.length > 1 ? successful.length - 1 : 1;
+    const total = scoreMap.get(response.modelId) ?? 0;
+    return {
+      ...response,
+      agreementScore: total / denominator,
+    };
+  });
+
+  const mergedSummary =
+    successful.length > 0 ? buildConsensusSummary(successful) : 'No successful responses to merge.';
+
+  return {
+    mergedSummary,
+    verificationNotes,
+    enrichedResponses,
+  };
+}
+
+function formatSimilarityNote(modelA: string, modelB: string, score: number): string {
+  if (score > 0.65) {
+    return `Strong agreement between ${modelA} and ${modelB} (${Math.round(score * 100)}% overlap).`;
+  }
+  if (score > 0.35) {
+    return `Partial alignment between ${modelA} and ${modelB} (${Math.round(score * 100)}% overlap).`;
+  }
+  return `Potential conflict between ${modelA} and ${modelB} (${Math.round(score * 100)}% overlap).`;
+}
+
+function computeTextSimilarity(a: string, b: string): number {
+  const tokensA = new Set(tokenizeText(a));
+  const tokensB = new Set(tokenizeText(b));
+  if (!tokensA.size || !tokensB.size) return 0;
+
+  let intersection = 0;
+  tokensA.forEach((token) => {
+    if (tokensB.has(token)) {
+      intersection += 1;
+    }
+  });
+
+  return intersection / Math.min(tokensA.size, tokensB.size);
+}
+
+function tokenizeText(text: string): string[] {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter((token) => token.length > 2);
+}
+
+function buildConsensusSummary(responses: RawMasterResponse[]): string {
+  const sentenceMap = new Map<string, { text: string; count: number }>();
+
+  responses.forEach((response) => {
+    extractSentences(response.content).forEach((sentence) => {
+      const key = sentence.toLowerCase();
+      if (!sentenceMap.has(key)) {
+        sentenceMap.set(key, { text: sentence, count: 1 });
+      } else {
+        sentenceMap.get(key)!.count += 1;
+      }
+    });
+  });
+
+  if (!sentenceMap.size) {
+    return 'No overlapping statements detected between the model outputs.';
+  }
+
+  const ranked = Array.from(sentenceMap.values())
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 6);
+
+  return ranked.map((item) => `- ${item.text}${item.count > 1 ? ` (${item.count} models confirm)` : ''}`).join('\n');
+}
+
+function extractSentences(text: string): string[] {
+  return text
+    .split(/(?<=[.!?])\s+/)
+    .map((sentence) => sentence.trim())
+    .filter((sentence) => sentence.length > 0);
+}
+
+function formatErrorMessage(possible: unknown, fallback: string): string {
+  if (typeof possible === 'string' && possible.trim()) {
+    return possible;
+  }
+  if (possible instanceof Error) {
+    return possible.message || fallback;
+  }
+  if (possible && typeof possible === 'object') {
+    try {
+      const serialized = JSON.stringify(possible);
+      if (serialized && serialized !== '{}') {
+        return serialized;
+      }
+    } catch {
+      // ignore JSON issues
+    }
+  }
+  return fallback;
 }

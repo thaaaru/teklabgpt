@@ -1,5 +1,4 @@
 import { NextResponse } from 'next/server';
-import { getModelIdForLLM } from '@/lib/llms';
 
 type ChatMessagePayload = {
   role: 'user' | 'assistant' | 'system';
@@ -22,14 +21,8 @@ export async function POST(request: Request) {
 
   const body = (await request.json()) as ChatRequestBody;
 
-  if (!body?.modelId) {
+  if (!body?.modelId?.trim()) {
     return NextResponse.json({ error: 'modelId is required.' }, { status: 400 });
-  }
-
-  const model = getModelIdForLLM(body.modelId);
-
-  if (!model) {
-    return NextResponse.json({ error: `Unknown model for id "${body.modelId}".` }, { status: 400 });
   }
 
   if (!Array.isArray(body.messages) || body.messages.length === 0) {
@@ -46,7 +39,7 @@ export async function POST(request: Request) {
         'X-Title': process.env.OPENROUTER_APP_NAME ?? 'ELINT-GPT',
       },
       body: JSON.stringify({
-        model,
+        model: body.modelId,
         messages: body.messages.map((message) => ({
           role: message.role,
           content: message.content,
