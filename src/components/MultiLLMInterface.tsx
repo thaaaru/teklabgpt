@@ -1,15 +1,6 @@
 'use client';
 
-import {
-  type ChangeEvent,
-  type ComponentType,
-  type KeyboardEvent,
-  type ReactNode,
-  useCallback,
-  useEffect,
-  useMemo,
-  useState,
-} from 'react';
+import { type ComponentType, type KeyboardEvent, type ReactNode, useMemo, useState } from 'react';
 import {
   Bot,
   Brain,
@@ -32,7 +23,6 @@ import {
   Wand2,
   Loader2,
   X,
-  ChevronDown,
 } from 'lucide-react';
 import { DEFAULT_LLM_CONFIG, pickAccentForModel, type LLMId } from '@/lib/llms';
 import { PROMPT_CATEGORIES, PROMPT_LIBRARY, type PromptDefinition, type PromptCategoryFilter } from '@/data/prompts';
@@ -90,12 +80,14 @@ const pickIconForModel = (modelId: string): ComponentType<{ className?: string }
   return hint?.icon ?? Sparkles;
 };
 
-const baseLLMs: LLMDefinition[] = DEFAULT_LLM_CONFIG.map((config) => ({
+const llms: LLMDefinition[] = DEFAULT_LLM_CONFIG.map((config) => ({
   ...config,
   icon: pickIconForModel(config.id),
 }));
 
-const defaultFeaturedIds = baseLLMs.slice(0, 5).map((llm) => llm.id);
+const INVALID_MODEL_PATTERN = /(no endpoints found|not a valid model)/i;
+const FRIENDLY_MODEL_ERROR = 'This model is temporarily unavailable. Please select another model.';
+const BOSS_MODEL_ID = 'openai/gpt-4o-mini';
 
 type ProjectLink = SidebarLink & {
   summary: string;
@@ -157,6 +149,7 @@ type ProjectModalState =
 type MasterPromptResult = {
   prompt: string;
   timestamp: string;
+  bossAnswer: string;
   responses: Array<{
     modelId: string;
     label: string;
@@ -169,30 +162,26 @@ type MasterPromptResult = {
 };
 
 export default function MultiLLMInterface() {
-  const [availableLLMs, setAvailableLLMs] = useState<LLMDefinition[]>(baseLLMs);
-  const [featuredLLMIds, setFeaturedLLMIds] = useState<string[]>(defaultFeaturedIds);
-  const [activeLLM, setActiveLLM] = useState<LLMId>(defaultFeaturedIds[0] ?? baseLLMs[0]?.id ?? 'openai/gpt-4o-mini');
+  const [activeLLM, setActiveLLM] = useState<LLMId>(llms[0].id);
   const [composerValue, setComposerValue] = useState('');
   const [conversations, setConversations] = useState<Record<string, Message[]>>(() =>
-    baseLLMs.reduce((acc, llm) => {
+    llms.reduce((acc, llm) => {
       acc[llm.id] = [createIntroMessage(llm.id)];
       return acc;
     }, {} as Record<string, Message[]>),
   );
   const [pendingLLMs, setPendingLLMs] = useState<Record<string, boolean>>(() =>
-    baseLLMs.reduce((acc, llm) => {
+    llms.reduce((acc, llm) => {
       acc[llm.id] = false;
       return acc;
     }, {} as Record<string, boolean>),
   );
   const [errors, setErrors] = useState<Record<string, string | null>>(() =>
-    baseLLMs.reduce((acc, llm) => {
+    llms.reduce((acc, llm) => {
       acc[llm.id] = null;
       return acc;
     }, {} as Record<string, string | null>),
   );
-  const [isFetchingModels, setIsFetchingModels] = useState(false);
-  const [modelPickerError, setModelPickerError] = useState<string | null>(null);
   const [isPromptModalOpen, setPromptModalOpen] = useState(false);
   const [promptSearch, setPromptSearch] = useState('');
   const [promptCategory, setPromptCategory] = useState<PromptCategoryFilter>('All');
@@ -203,116 +192,7 @@ export default function MultiLLMInterface() {
   const [masterResult, setMasterResult] = useState<MasterPromptResult | null>(null);
   const [isMasterPrompting, setMasterPrompting] = useState(false);
 
-  function ensureModelState(llmId: string) {
-    setConversations((prev) => {
-      if (prev[llmId]) return prev;
-      return {
-        ...prev,
-        [llmId]: [createIntroMessage(llmId)],
-      };
-    });
-    setPendingLLMs((prev) => {
-      if (llmId in prev) return prev;
-      return { ...prev, [llmId]: false };
-    });
-    setErrors((prev) => {
-      if (llmId in prev) return prev;
-      return { ...prev, [llmId]: null };
-    });
-  }
-
-  useEffect(() => {
-    const controller = new AbortController();
-    const loadModels = async () => {
-      setIsFetchingModels(true);
-      setModelPickerError(null);
-      try {
-        const response = await fetch('/api/models', { signal: controller.signal });
-        if (!response.ok) {
-          throw new Error('Unable to fetch OpenRouter models.');
-        }
-        const payload = await response.json();
-        const remoteModels: LLMDefinition[] = Array.isArray(payload?.models)
-          ? payload.models
-              .filter((model: { id?: string }) => typeof model?.id === 'string' && model.id.trim().length > 0)
-              .map((model: { id: string; name?: string; description?: string }) => {
-                const normalizedId = model.id.trim();
-                const preset = baseLLMs.find((entry) => entry.id === normalizedId);
-                return {
-                  id: normalizedId,
-                  label: preset?.label ?? model.name ?? normalizedId,
-                  description: preset?.description ?? model.description ?? 'Available via OpenRouter',
-                  accent: preset?.accent ?? pickAccentForModel(normalizedId),
-                  icon: preset?.icon ?? pickIconForModel(normalizedId),
-                };
-              })
-          : [];
-
-        const baseIds = new Set(baseLLMs.map((llm) => llm.id));
-        const curated = baseLLMs.map((preset) => {
-          const remote = remoteModels.find((model) => model.id === preset.id);
-          return remote
-            ? {
-                ...remote,
-                label: preset.label || remote.label,
-                description: preset.description || remote.description,
-                accent: preset.accent,
-                icon: preset.icon,
-              }
-            : preset;
-        });
-        const extras = remoteModels.filter((model) => !baseIds.has(model.id));
-        setAvailableLLMs([...curated, ...extras]);
-      } catch (error) {
-        if (!controller.signal.aborted) {
-          setModelPickerError(error instanceof Error ? error.message : 'Failed to load OpenRouter models.');
-        }
-      } finally {
-        if (!controller.signal.aborted) {
-          setIsFetchingModels(false);
-        }
-      }
-    };
-
-    void loadModels();
-    return () => controller.abort();
-  }, []);
-
-  useEffect(() => {
-    if (!availableLLMs.length) return;
-    setFeaturedLLMIds((prev) => {
-      const availableIds = availableLLMs.map((llm) => llm.id);
-      const deduped = prev.filter((id, index) => availableIds.includes(id) && prev.indexOf(id) === index);
-      if (deduped.length >= 5) {
-        return deduped.slice(0, 5);
-      }
-      const extras = availableIds.filter((id) => !deduped.includes(id)).slice(0, 5 - deduped.length);
-      return deduped.length || extras.length ? [...deduped, ...extras] : prev;
-    });
-  }, [availableLLMs]);
-
-  useEffect(() => {
-    if (!featuredLLMIds.length) return;
-    setActiveLLM((current) => (current && featuredLLMIds.includes(current) ? current : featuredLLMIds[0]));
-  }, [featuredLLMIds]);
-
-  useEffect(() => {
-    if (activeLLM) {
-      ensureModelState(activeLLM);
-    }
-  }, [activeLLM]);
-
-  const getLLMDefinition = useCallback(
-    (llmId: string) => availableLLMs.find((llm) => llm.id === llmId),
-    [availableLLMs],
-  );
-
-  const resetConversationForLLM = (llmId: string) => {
-    setConversations((prev) => ({
-      ...prev,
-      [llmId]: [createIntroMessage(llmId)],
-    }));
-  };
+  const getLLMDefinition = (llmId: string) => llms.find((llm) => llm.id === llmId);
 
   const handleMoveChatToProject = (projectId: string) => {
     const currentMessages = conversations[activeLLM] ?? [];
@@ -341,7 +221,10 @@ export default function MultiLLMInterface() {
       ...prev,
       [projectId]: [newChat, ...(prev[projectId] ?? [])],
     }));
-    resetConversationForLLM(activeLLM);
+    setConversations((prev) => ({
+      ...prev,
+      [activeLLM]: [createIntroMessage(activeLLM)],
+    }));
     setProjectModalState(null);
   };
 
@@ -382,7 +265,7 @@ export default function MultiLLMInterface() {
     const chat = chats.find((entry) => entry.id === chatId);
     if (!chat) return;
 
-    handleFeatureLLM(chat.llmId);
+    setActiveLLM(chat.llmId);
     setConversations((prev) => ({
       ...prev,
       [chat.llmId]: chat.messages.map((message) => ({ ...message })),
@@ -393,13 +276,9 @@ export default function MultiLLMInterface() {
   const activeConversation = conversations[activeLLM] ?? [];
   const isThinking = pendingLLMs[activeLLM];
   const activeError = errors[activeLLM];
-  const featuredLLMs = useMemo(
-    () => featuredLLMIds.map((id) => getLLMDefinition(id)).filter((llm): llm is LLMDefinition => Boolean(llm)),
-    [featuredLLMIds, getLLMDefinition],
-  );
-  const masterButtonDisabled = !composerValue.trim() || featuredLLMs.length < 5 || isMasterPrompting;
-  const masterBlockedMessage =
-    featuredLLMs.length < 5 ? 'Pin five featured models above to enable the master prompt.' : null;
+  const featuredLLMs = llms;
+  const masterButtonDisabled = !composerValue.trim() || isMasterPrompting;
+  const masterBlockedMessage = null;
   const filteredPrompts = useMemo(() => {
     const query = promptSearch.trim().toLowerCase();
     return PROMPT_LIBRARY.filter((prompt) => {
@@ -482,9 +361,10 @@ export default function MultiLLMInterface() {
         timestamp: timestamp(),
       };
       const readable = formatErrorMessage(error, 'Unknown error occurred.');
+      const displayMessage = sanitizeModelError(readable);
       setErrors((prev) => ({
         ...prev,
-        [activeLLM]: readable,
+        [activeLLM]: displayMessage,
       }));
       setConversations((prev) => ({
         ...prev,
@@ -499,14 +379,13 @@ export default function MultiLLMInterface() {
     if (!composerValue.trim() || isMasterPrompting || featuredLLMs.length < 5) return;
     const prompt = composerValue.trim();
     const promptTimestamp = timestamp();
-    const targetLLMs = featuredLLMs.slice(0, 5);
+    const targetLLMs = featuredLLMs;
     setComposerValue('');
     setMasterPrompting(true);
 
     try {
       const responses = await Promise.all(
         targetLLMs.map(async (llm) => {
-          ensureModelState(llm.id);
           const userMessage: Message = {
             id: `master-user-${llm.id}-${Date.now()}`,
             role: 'user',
@@ -578,7 +457,8 @@ export default function MultiLLMInterface() {
               content: 'Master prompt failed for this model.',
               timestamp: timestamp(),
             };
-            setErrors((prev) => ({ ...prev, [llm.id]: message }));
+            const displayMessage = sanitizeModelError(message);
+            setErrors((prev) => ({ ...prev, [llm.id]: displayMessage }));
             setConversations((prev) => ({
               ...prev,
               [llm.id]: [...updatedThread, fallbackMessage],
@@ -587,7 +467,7 @@ export default function MultiLLMInterface() {
               modelId: llm.id,
               label: llm.label,
               content: '',
-              error: message,
+              error: displayMessage,
             };
           } finally {
             setPendingLLMs((prev) => ({ ...prev, [llm.id]: false }));
@@ -596,9 +476,11 @@ export default function MultiLLMInterface() {
       );
 
       const analysis = analyzeMasterResponses(responses);
+      const bossAnswer = await generateBossAnswer(prompt, analysis.enrichedResponses);
       setMasterResult({
         prompt,
         timestamp: promptTimestamp,
+        bossAnswer,
         responses: analysis.enrichedResponses,
         mergedSummary: analysis.mergedSummary,
         verificationNotes: analysis.verificationNotes,
@@ -607,6 +489,7 @@ export default function MultiLLMInterface() {
       setMasterResult({
         prompt,
         timestamp: promptTimestamp,
+        bossAnswer: 'Master prompt failed before collecting responses.',
         responses: [],
         mergedSummary: 'Master prompt failed before collecting responses.',
         verificationNotes: [
@@ -644,16 +527,6 @@ export default function MultiLLMInterface() {
     setProjectModalState({ type: 'action', payload });
   };
 
-  const handleFeatureLLM = (llmId: string) => {
-    if (!llmId) return;
-    ensureModelState(llmId);
-    setFeaturedLLMIds((prev) => {
-      const filtered = prev.filter((id) => id !== llmId);
-      return [llmId, ...filtered].slice(0, 5);
-    });
-    setActiveLLM(llmId);
-  };
-
   const handleProjectLinkClick = (link: SidebarLink) => {
     const project = projectLinks.find((entry) => entry.id === link.id);
     if (!project) return;
@@ -678,15 +551,7 @@ export default function MultiLLMInterface() {
 
       <div className="flex-1 flex flex-col lg:border-l border-white/5 bg-gradient-to-br from-[#0a101c] via-[#05080f] to-[#020409]">
         <MobileHeader onMenuClick={() => setSidebarOpen(true)} />
-        <TopNavigation
-          activeLLM={activeLLM}
-          featuredLLMs={featuredLLMs}
-          availableLLMs={availableLLMs}
-          onSelectLLM={setActiveLLM}
-          onFeatureLLM={handleFeatureLLM}
-          isLoadingModels={isFetchingModels}
-          modelError={modelPickerError}
-        />
+        <TopNavigation activeLLM={activeLLM} llms={featuredLLMs} onSelectLLM={setActiveLLM} />
 
         <ConversationPane
           activeLLM={activeLLM}
@@ -1018,53 +883,26 @@ function PromptHistorySection({
 
 type TopNavigationProps = {
   activeLLM: LLMId;
-  featuredLLMs: LLMDefinition[];
-  availableLLMs: LLMDefinition[];
+  llms: LLMDefinition[];
   onSelectLLM: (id: LLMId) => void;
-  onFeatureLLM: (id: LLMId) => void;
-  isLoadingModels?: boolean;
-  modelError?: string | null;
 };
 
-function TopNavigation({
-  activeLLM,
-  featuredLLMs,
-  availableLLMs,
-  onSelectLLM,
-  onFeatureLLM,
-  isLoadingModels,
-  modelError,
-}: TopNavigationProps) {
-  const availableOptions = availableLLMs.filter(
-    (option) => !featuredLLMs.some((featured) => featured.id === option.id),
-  );
-  const limitedOptions = availableOptions.slice(0, 10);
-  const extraCount = Math.max(availableOptions.length - limitedOptions.length, 0);
-
+function TopNavigation({ activeLLM, llms, onSelectLLM }: TopNavigationProps) {
   return (
     <header className="border-b border-white/5 px-4 md:px-8 pt-4 pb-3 backdrop-blur sticky top-12 lg:top-0 z-20 bg-gradient-to-b from-[#05080f]/95 via-[#05080f]/85 to-transparent">
-      <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between mb-3">
-        <div className="flex items-center gap-3 text-sm text-white/70">
-          <History className="w-4 h-4 text-white/40" />
-          <span>Choose a model</span>
-        </div>
-        <ModelSelector
-          options={limitedOptions}
-          onSelect={onFeatureLLM}
-          isLoading={isLoadingModels}
-          error={modelError}
-          extraCount={extraCount}
-        />
+      <div className="flex items-center gap-3 text-sm text-white/70 mb-3">
+        <History className="w-4 h-4 text-white/40" />
+        <span>Choose a model</span>
       </div>
-      <div className="flex gap-3 overflow-x-auto pb-1">
-        {featuredLLMs.map((llm) => {
+      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3 pb-1">
+        {llms.map((llm) => {
           const Icon = llm.icon;
           const isActive = llm.id === activeLLM;
           return (
             <button
               key={llm.id}
               onClick={() => onSelectLLM(llm.id)}
-              className={`min-w-[180px] flex-1 rounded-2xl border px-4 py-4 text-left transition ${
+              className={`rounded-2xl border px-4 py-4 text-left transition ${
                 isActive ? 'border-white bg-white/10' : 'border-white/10 bg-white/5 hover:border-white/30'
               }`}
             >
@@ -1080,58 +918,8 @@ function TopNavigation({
             </button>
           );
         })}
-        {!featuredLLMs.length && (
-          <div className="text-sm text-white/60 py-4">Select a model from OpenRouter to get started.</div>
-        )}
       </div>
     </header>
-  );
-}
-
-type ModelSelectorProps = {
-  options: LLMDefinition[];
-  onSelect: (id: string) => void;
-  isLoading?: boolean;
-  error?: string | null;
-  extraCount?: number;
-};
-
-function ModelSelector({ options, onSelect, isLoading, error, extraCount = 0 }: ModelSelectorProps) {
-  const [selection, setSelection] = useState('');
-  const sortedOptions = [...options].sort((a, b) => a.label.localeCompare(b.label));
-
-  const handleChange = (event: ChangeEvent<HTMLSelectElement>) => {
-    const value = event.target.value;
-    if (!value) return;
-    onSelect(value);
-    setSelection('');
-  };
-
-  return (
-    <div className="relative w-full max-w-xs text-xs text-white/70">
-      <select
-        value={selection}
-        onChange={handleChange}
-        className="w-full appearance-none rounded-2xl border border-white/10 bg-white/5 px-4 py-2.5 pr-10 text-white/80 focus:border-white/40 focus:outline-none text-sm"
-      >
-        <option value="">
-          {isLoading ? 'Loading OpenRouter models…' : 'Add OpenRouter model to top bar'}
-        </option>
-        {sortedOptions.map((option) => (
-          <option key={option.id} value={option.id} className="bg-gray-900 text-white">
-            {option.label}
-          </option>
-        ))}
-      </select>
-      <ChevronDown className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-white/60" />
-      {error ? (
-        <p className="text-xs text-red-400 mt-1">{error}</p>
-      ) : (
-        <p className="text-[11px] text-white/40 mt-1">
-          Showing the top 10 addable models{extraCount > 0 ? ` (${extraCount} more hidden)` : ''}. Only five can be featured above.
-        </p>
-      )}
-    </div>
   );
 }
 
@@ -1224,6 +1012,13 @@ function MasterPromptSummary({ result, onClear }: MasterPromptSummaryProps) {
         <div className="rounded-2xl border border-white/10 bg-white/5 p-4 text-sm text-white/80">
           <p className="text-xs uppercase text-white/40 mb-1">Prompt</p>
           <p className="whitespace-pre-wrap">{result.prompt}</p>
+        </div>
+
+        <div className="space-y-2">
+          <p className="text-xs uppercase tracking-[0.3em] text-white/40">Boss final answer (ChatGPT)</p>
+          <div className="rounded-2xl border border-emerald-300/40 bg-emerald-400/10 p-4 text-sm text-white/90 space-y-2">
+            {renderFormattedContent(result.bossAnswer)}
+          </div>
         </div>
 
         <div className="space-y-2">
@@ -1804,4 +1599,66 @@ function formatErrorMessage(possible: unknown, fallback: string): string {
     }
   }
   return fallback;
+}
+
+function sanitizeModelError(message: string): string {
+  return INVALID_MODEL_PATTERN.test(message) ? FRIENDLY_MODEL_ERROR : message;
+}
+
+async function generateBossAnswer(prompt: string, responses: MasterPromptResult['responses']): Promise<string> {
+  const successful = responses.filter((response) => response.content.trim() && !response.error);
+
+  if (!successful.length) {
+    return 'No reliable responses were available for the boss to review.';
+  }
+
+  const summaryBlock = successful
+    .map((response, index) => `Response ${index + 1} (${response.label}):\n${response.content}`)
+    .join('\n\n');
+
+  const bossPrompt = `You are the Boss AI, tasked with reviewing multiple model responses and drafting one authoritative final answer.
+
+Original prompt:
+${prompt}
+
+Team responses:
+${summaryBlock}
+
+Deliver a decisive final answer that:
+- Synthesizes consensus and highlights unique insights
+- Resolves contradictions with clear reasoning
+- Adds any critical caveats or next steps
+- Writes in a confident, executive voice`;
+
+  try {
+    const response = await fetch('/api/chat', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        modelId: BOSS_MODEL_ID,
+        messages: [
+          {
+            role: 'system',
+            content: 'You are the Boss AI who synthesizes multiple expert responses into one final directive.',
+          },
+          { role: 'user', content: bossPrompt },
+        ],
+      }),
+    });
+
+    if (!response.ok) {
+      const errorPayload = await response.json().catch(() => ({}));
+      const message = errorPayload?.error ?? 'Boss model is unavailable.';
+      throw new Error(message);
+    }
+
+    const data = await response.json();
+    const assistantMessage = data?.message;
+    return parseAssistantContent(assistantMessage?.content) ?? 'Boss could not generate a response.';
+  } catch (error) {
+    console.error('[master] Boss synthesis failed', error);
+    return sanitizeModelError(formatErrorMessage(error, 'Boss synthesis failed.'));
+  }
 }

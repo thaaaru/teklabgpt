@@ -9,10 +9,16 @@ export type LLMConfig = {
 
 export const DEFAULT_LLM_CONFIG: LLMConfig[] = [
   {
-    id: 'openai/gpt-4-turbo',
-    label: 'ChatGPT (GPT-4 Turbo)',
+    id: 'openai/gpt-4o-mini',
+    label: 'ChatGPT (GPT-4o mini)',
     description: 'Reasoning & ideation',
     accent: 'from-emerald-500 to-teal-400',
+  },
+  {
+    id: 'google/gemini-2.0-flash-001',
+    label: 'Gemini 2.0 Flash',
+    description: 'Realtime multimodal',
+    accent: 'from-sky-400 to-cyan-500',
   },
   {
     id: 'anthropic/claude-3.5-sonnet',
@@ -21,13 +27,7 @@ export const DEFAULT_LLM_CONFIG: LLMConfig[] = [
     accent: 'from-indigo-500 to-blue-500',
   },
   {
-    id: 'google/gemini-pro-1.5',
-    label: 'Gemini Pro 1.5',
-    description: 'General multimodal research',
-    accent: 'from-sky-400 to-cyan-500',
-  },
-  {
-    id: 'perplexity/llama-3.1-sonar-large-128k-online',
+    id: 'perplexity/sonar',
     label: 'Perplexity Sonar',
     description: 'Search & synthesis',
     accent: 'from-fuchsia-500 to-pink-500',
@@ -37,6 +37,12 @@ export const DEFAULT_LLM_CONFIG: LLMConfig[] = [
     label: 'DeepSeek Chat',
     description: 'Fast pragmatic reasoning',
     accent: 'from-orange-400 to-amber-500',
+  },
+  {
+    id: 'qwen/qwen-2.5-72b-instruct',
+    label: 'Qwen 2.5 72B',
+    description: 'Multilingual + code',
+    accent: 'from-purple-500 to-rose-500',
   },
 ];
 
